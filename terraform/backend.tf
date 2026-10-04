@@ -4,6 +4,6 @@ terraform {
     resource_group_name  = "koalatech-tfstate-rg"
     storage_account_name = "koalatechtfstatesahan"
     container_name       = "tfstate"
-    key                  = "week08.tfstate"
+    key                  = "sit722-cost-aware.tfstate"
   }
 }

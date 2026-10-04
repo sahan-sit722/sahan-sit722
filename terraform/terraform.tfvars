@@ -1,15 +1,12 @@
 location            = "Australia East"
-resource_group_name = "koalatech-week08-rg"
+resource_group_name = "sit722-cost-aware-rg"
 
-# Replace with a unique name for your Azure Container Registry 
-acr_name = "koalatechsahanweek08"
+acr_name = "sit722costawareacr"
 
-# Replace with a unique name for your Azure Storage Account
-storage_account_name = "koalatechsahanweek08"
+storage_account_name = "sit722costawarest"
 
-# Replace with a unique name for your Azure Kubernetes Service cluster
-aks_cluster_name = "koalatech-sahan-week08-aks"
-aks_dns_prefix   = "koalatech"
+aks_cluster_name = "sit722-cost-aware-aks"
+aks_dns_prefix   = "sit722-cost-aware"
 
 aks_node_count   = 3
 aks_node_vm_size = "Standard_D2s_v3"
@@ -17,8 +14,8 @@ aks_node_vm_size = "Standard_D2s_v3"
 environment = "development"
 
 tags = {
-  Project     = "KoalaTech Course Platform"
+  Project     = "Cost Aware DevOps"
   ManagedBy   = "Terraform"
-  Practical   = "Week08"
+  Practical   = "10.3HD"
   Environment = "Development"
 }
