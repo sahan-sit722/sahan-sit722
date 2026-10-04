@@ -8,7 +8,7 @@ storage_account_name = "sit722costawarest"
 aks_cluster_name = "sit722-cost-aware-aks"
 aks_dns_prefix   = "sit722-cost-aware"
 
-aks_node_count   = 5
+aks_node_count   = 7
 aks_node_vm_size = "Standard_D2s_v3"
 
 environment = "development"
