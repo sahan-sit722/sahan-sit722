@@ -1,0 +1,92 @@
+name: 05 - AKS Sleep Wake Cost Control
+
+on:
+  schedule:
+    # GitHub cron uses UTC. These roughly represent 08:00 start and 22:00 stop in Melbourne during daylight saving.
+    - cron: "0 21 * * 0-4"
+    - cron: "0 11 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "AKS action"
+        type: choice
+        options: [status, start, stop]
+        default: status
+
+permissions:
+  contents: read
+
+jobs:
+  control:
+    name: AKS Cost Control
+    runs-on: ubuntu-latest
+    # Keep schedules safe until explicitly enabled as a repository variable.
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_AKS_SCHEDULE == 'true'
+
+    steps:
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Select action
+        id: select
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ACTION="${{ inputs.action }}"
+          elif [ "${{ github.event.schedule }}" = "0 21 * * 0-4" ]; then
+            ACTION="start"
+          else
+            ACTION="stop"
+          fi
+          echo "action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "Selected action: $ACTION"
+
+      - name: Show current AKS state
+        id: before
+        run: |
+          STATE=$(az aks show \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --query powerState.code -o tsv)
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "Current state: $STATE"
+
+      - name: Stop AKS
+        if: steps.select.outputs.action == 'stop' && steps.before.outputs.state != 'Stopped'
+        run: |
+          az aks stop \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}"
+
+      - name: Start AKS
+        if: steps.select.outputs.action == 'start' && steps.before.outputs.state != 'Running'
+        run: |
+          az aks start \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}"
+
+      - name: Verify final AKS state
+        id: after
+        run: |
+          STATE=$(az aks show \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --query powerState.code -o tsv)
+          echo "state=$STATE" >> "$GITHUB_OUTPUT"
+          echo "Final state: $STATE"
+          echo "## AKS cost-control action" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Requested action: ${{ steps.select.outputs.action }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Previous state: ${{ steps.before.outputs.state }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Final state: $STATE" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Discord
+        run: |
+          WEBHOOK='${{ secrets.DISCORD_WEBHOOK_URL }}'
+          if [ -z "$WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK_URL is not configured. Skipping notification."
+            exit 0
+          fi
+          jq -n --arg content "💤 KoalaTech AKS action '${{ steps.select.outputs.action }}' completed. State: ${{ steps.after.outputs.state }}." '{content:$content}' \
+            | curl -fsS -H 'Content-Type: application/json' -d @- "$WEBHOOK"

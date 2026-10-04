@@ -1,0 +1,183 @@
+name: 06 - Azure Budget Cost Control
+
+on:
+  schedule:
+    - cron: "15 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Use Azure Cost Management API or a simulated value"
+        type: choice
+        options: [azure, simulation]
+        default: azure
+      simulated_spend:
+        description: "Spend value used only in simulation mode"
+        type: string
+        default: "45"
+      enforce_action:
+        description: "Actually stop AKS when the threshold is reached"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  MONTHLY_BUDGET: ${{ vars.AZURE_MONTHLY_BUDGET || '50' }}
+  BUDGET_THRESHOLD_PERCENT: ${{ vars.AZURE_BUDGET_THRESHOLD_PERCENT || '80' }}
+
+jobs:
+  budget-control:
+    name: Check Spend and Protect AKS Budget
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || vars.ENABLE_BUDGET_AUTOMATION == 'true'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Decide cost source
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "value=azure" >> "$GITHUB_OUTPUT"
+            echo "enforce=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ inputs.mode }}" >> "$GITHUB_OUTPUT"
+            echo "enforce=${{ inputs.enforce_action }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Query month-to-date Azure cost
+        id: azure_cost
+        if: steps.mode.outputs.value == 'azure'
+        shell: bash
+        run: |
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+          cat > cost-query.json <<'JSON'
+          {
+            "type": "ActualCost",
+            "timeframe": "MonthToDate",
+            "dataset": {
+              "granularity": "None",
+              "aggregation": {
+                "totalCost": {
+                  "name": "Cost",
+                  "function": "Sum"
+                }
+              }
+            }
+          }
+          JSON
+
+          az rest \
+            --method post \
+            --url "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.CostManagement/query?api-version=2025-03-01" \
+            --headers Content-Type=application/json \
+            --body @cost-query.json > cost-response.json
+
+          python - <<'PY'
+          import json, os
+          with open('cost-response.json', encoding='utf-8') as f:
+              data = json.load(f)
+          props = data.get('properties', {})
+          columns = [c.get('name', '') for c in props.get('columns', [])]
+          rows = props.get('rows', [])
+          if not rows:
+              spend, currency = 0.0, 'USD'
+          else:
+              row = rows[0]
+              lowered = [x.lower() for x in columns]
+              cost_index = lowered.index('totalcost') if 'totalcost' in lowered else 0
+              currency_index = next((i for i, n in enumerate(lowered) if 'currency' in n), None)
+              spend = float(row[cost_index])
+              currency = str(row[currency_index]) if currency_index is not None else 'USD'
+          out = os.environ['GITHUB_OUTPUT']
+          with open(out, 'a', encoding='utf-8') as f:
+              f.write(f"spend={spend:.2f}\n")
+              f.write(f"currency={currency}\n")
+          print(f"Azure month-to-date cost: {spend:.2f} {currency}")
+          PY
+
+      - name: Use simulated spend
+        id: simulated_cost
+        if: steps.mode.outputs.value == 'simulation'
+        run: |
+          echo "spend=${{ inputs.simulated_spend }}" >> "$GITHUB_OUTPUT"
+          echo "currency=USD" >> "$GITHUB_OUTPUT"
+          echo "Simulation mode: current spend = ${{ inputs.simulated_spend }} USD"
+
+      - name: Select spend value
+        id: cost
+        run: |
+          if [ "${{ steps.mode.outputs.value }}" = "azure" ]; then
+            echo "spend=${{ steps.azure_cost.outputs.spend }}" >> "$GITHUB_OUTPUT"
+            echo "currency=${{ steps.azure_cost.outputs.currency }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "spend=${{ steps.simulated_cost.outputs.spend }}" >> "$GITHUB_OUTPUT"
+            echo "currency=${{ steps.simulated_cost.outputs.currency }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Evaluate budget threshold
+        id: budget
+        run: |
+          python scripts/check_budget.py \
+            --spend "${{ steps.cost.outputs.spend }}" \
+            --budget "$MONTHLY_BUDGET" \
+            --threshold-percent "$BUDGET_THRESHOLD_PERCENT" \
+            --currency "${{ steps.cost.outputs.currency }}"
+
+      - name: Stop AKS when threshold is reached
+        id: action
+        if: steps.budget.outputs.action_required == 'true' && steps.mode.outputs.enforce == 'true'
+        run: |
+          STATE=$(az aks show \
+            --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+            --name "${{ vars.AKS_CLUSTER_NAME }}" \
+            --query powerState.code -o tsv)
+          if [ "$STATE" = "Stopped" ]; then
+            echo "AKS is already stopped."
+          else
+            az aks stop \
+              --resource-group "${{ vars.AKS_RESOURCE_GROUP }}" \
+              --name "${{ vars.AKS_CLUSTER_NAME }}"
+          fi
+          echo "performed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Azure budget control"
+            echo "- Source: ${{ steps.mode.outputs.value }}"
+            echo "- Current spend: ${{ steps.cost.outputs.spend }} ${{ steps.cost.outputs.currency }}"
+            echo "- Configured budget: ${MONTHLY_BUDGET} ${{ steps.cost.outputs.currency }}"
+            echo "- Trigger point: ${BUDGET_THRESHOLD_PERCENT}%"
+            echo "- Budget used: ${{ steps.budget.outputs.percentage }}%"
+            echo "- Action required: ${{ steps.budget.outputs.action_required }}"
+            echo "- Enforcement enabled: ${{ steps.mode.outputs.enforce }}"
+            echo "- AKS stop performed: ${{ steps.action.outputs.performed || 'false' }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Discord
+        run: |
+          WEBHOOK='${{ secrets.DISCORD_WEBHOOK_URL }}'
+          if [ -z "$WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK_URL is not configured. Skipping notification."
+            exit 0
+          fi
+          if [ "${{ steps.budget.outputs.action_required }}" = "true" ]; then
+            ICON="🚨"
+          else
+            ICON="✅"
+          fi
+          jq -n --arg content "$ICON KoalaTech budget check: ${{ steps.cost.outputs.spend }} ${{ steps.cost.outputs.currency }} used, ${{ steps.budget.outputs.percentage }}% of budget. Action required: ${{ steps.budget.outputs.action_required }}. AKS stop performed: ${{ steps.action.outputs.performed || 'false' }}." '{content:$content}' \
+            | curl -fsS -H 'Content-Type: application/json' -d @- "$WEBHOOK"

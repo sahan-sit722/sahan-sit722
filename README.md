@@ -311,3 +311,10 @@ After the production deployment completes:
 - Access the production application.
 - Confirm that the application is working correctly.
 - Verify that production is running the same image SHA that was tested in staging.
+---
+
+# Task 10.3HD Extension
+
+This repository has been extended with **Cost-Aware Infrastructure as Code and Automated AKS Cost Control**. The implementation adds an Azure Retail Prices API cost gate for Terraform plans, automated/manual AKS sleep-wake control, Azure Cost Management threshold checking with a safe simulation mode, Discord notifications, and unit tests for the custom cost logic.
+
+See [`10.3HD_IMPLEMENTATION_GUIDE.md`](./10.3HD_IMPLEMENTATION_GUIDE.md) for setup, testing, evidence collection and cleanup steps.

@@ -1,57 +1,68 @@
-name: 00 - Infrastructure
+name: 00 - Cost-Aware Infrastructure
 
 on:
-  # Plan and apply when infrastructure code changes
-  push:
-    branches:
-      - main
+  pull_request:
+    branches: [main]
     paths:
       - "terraform/**"
+      - "scripts/**"
       - "kubernetes/monitoring/**"
       - ".github/workflows/00-infrastructure.yml"
-
-  # Manual run: plan, apply or destroy
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - "scripts/**"
+      - "kubernetes/monitoring/**"
+      - ".github/workflows/00-infrastructure.yml"
   workflow_dispatch:
     inputs:
       action:
         description: "Terraform action"
         type: choice
-        options:
-          - plan
-          - apply
-          - destroy
+        options: [plan, apply, destroy]
         default: plan
+      allow_cost_override:
+        description: "Allow a manual apply even if the cost gate is above the limit"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  pull-requests: read
 
 env:
-  # Terraform azurerm provider reads these
   ARM_CLIENT_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientId }}
   ARM_CLIENT_SECRET: ${{ fromJSON(secrets.AZURE_CREDENTIALS).clientSecret }}
   ARM_SUBSCRIPTION_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).subscriptionId }}
   ARM_TENANT_ID: ${{ fromJSON(secrets.AZURE_CREDENTIALS).tenantId }}
   TF_IN_AUTOMATION: "true"
+  COST_MAX_HOURLY_USD: ${{ vars.COST_MAX_HOURLY_USD || '0.50' }}
+  AZURE_PRICE_FALLBACK_USD: ${{ vars.AZURE_PRICE_FALLBACK_USD || '0.125' }}
 
 jobs:
-
-  # =========================================================
-  # Terraform: validate, plan, apply
-  # =========================================================
   terraform:
-    name: Terraform
+    name: Validate, Plan and Cost Gate
     runs-on: ubuntu-latest
+    outputs:
+      applied: ${{ steps.apply.outcome == 'success' }}
 
     defaults:
       run:
         working-directory: terraform
 
-    outputs:
-      applied: ${{ steps.apply.outcome == 'success' }}
-
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Test cost-control scripts
+        working-directory: .
+        run: python -m unittest discover -s scripts/tests -v
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
@@ -59,42 +70,115 @@ jobs:
       - name: Terraform format check
         run: terraform fmt -check -recursive
 
-      - name: Terraform init
+      - name: Terraform init with remote Azure state
         run: terraform init -input=false
 
       - name: Terraform validate
         run: terraform validate
 
       - name: Terraform plan
-        if: github.event.inputs.action != 'destroy'
+        id: plan
+        if: github.event_name != 'workflow_dispatch' || inputs.action != 'destroy'
         run: |
           terraform plan -input=false -out=tfplan
+          terraform show -json tfplan > tfplan.json
           terraform show -no-color tfplan > plan.txt
-          echo '### Terraform plan' >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -n 40 plan.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-      # Apply on push to main, or manual "apply"
+      - name: Estimate planned AKS cost using Azure Retail Prices API
+        id: cost
+        if: steps.plan.outcome == 'success'
+        continue-on-error: true
+        working-directory: .
+        run: |
+          python scripts/estimate_aks_cost.py \
+            --plan terraform/tfplan.json \
+            --max-hourly-cost "$COST_MAX_HOURLY_USD" \
+            --fallback-unit-price "$AZURE_PRICE_FALLBACK_USD"
+
+      - name: Add plan and cost result to job summary
+        if: steps.plan.outcome == 'success'
+        run: |
+          {
+            echo "## Terraform plan"
+            echo '```'
+            tail -n 40 plan.txt
+            echo '```'
+            echo "## AKS cost gate"
+            echo "- VM size: ${{ steps.cost.outputs.vm_size }}"
+            echo "- Nodes: ${{ steps.cost.outputs.node_count }}"
+            echo "- Region: ${{ steps.cost.outputs.region }}"
+            echo "- Unit price: ${{ steps.cost.outputs.unit_price }} ${{ steps.cost.outputs.currency }}/hour"
+            echo "- Planned worker cost: ${{ steps.cost.outputs.hourly_cost }} ${{ steps.cost.outputs.currency }}/hour"
+            echo "- Approx. monthly run rate: ${{ steps.cost.outputs.monthly_cost }} ${{ steps.cost.outputs.currency }}"
+            echo "- Gate limit: ${COST_MAX_HOURLY_USD} ${{ steps.cost.outputs.currency }}/hour"
+            echo "- Price source: ${{ steps.cost.outputs.price_source }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Enforce pull-request cost gate
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.cost.outcome == 'failure' &&
+          !contains(github.event.pull_request.labels.*.name, 'cost-approved')
+        run: |
+          echo "Cost gate blocked this infrastructure change."
+          echo "If the increase is intentional, add the 'cost-approved' label and rerun the workflow."
+          exit 1
+
+      - name: Record approved PR cost override
+        if: >-
+          github.event_name == 'pull_request' &&
+          steps.cost.outcome == 'failure' &&
+          contains(github.event.pull_request.labels.*.name, 'cost-approved')
+        working-directory: .
+        run: |
+          echo "### Cost override accepted" >> "$GITHUB_STEP_SUMMARY"
+          echo "PR label 'cost-approved' allowed this intentionally higher-cost plan." >> "$GITHUB_STEP_SUMMARY"
+          WEBHOOK='${{ secrets.DISCORD_WEBHOOK_URL }}'
+          if [ -n "$WEBHOOK" ]; then
+            jq -n --arg content "✅ KoalaTech cost override approved for PR #${{ github.event.pull_request.number }}. Planned AKS cost: ${{ steps.cost.outputs.hourly_cost }} ${{ steps.cost.outputs.currency }}/hour." '{content:$content}' \
+              | curl -fsS -H 'Content-Type: application/json' -d @- "$WEBHOOK"
+          fi
+
+      - name: Enforce manual apply cost gate
+        if: >-
+          github.event_name == 'workflow_dispatch' &&
+          inputs.action == 'apply' &&
+          steps.cost.outcome == 'failure' &&
+          inputs.allow_cost_override != true
+        run: |
+          echo "Manual apply blocked by the cost gate."
+          echo "Rerun with 'allow_cost_override' only if the higher cost is intentional."
+          exit 1
+
+      # A push to main is assumed to have passed the PR cost gate through branch protection.
       - name: Terraform apply
         id: apply
-        if: >
-          github.event_name == 'push' ||
-          github.event.inputs.action == 'apply'
-        run: terraform apply -input=false tfplan
+        if: >-
+          (github.event_name == 'push') ||
+          (github.event_name == 'workflow_dispatch' && inputs.action == 'apply' &&
+           (steps.cost.outcome == 'success' || inputs.allow_cost_override == true))
+        run: terraform apply -input=false -auto-approve tfplan
 
       - name: Terraform output
         if: steps.apply.outcome == 'success'
         run: terraform output
 
-      # Manual "destroy" only, to save Azure credit
+      - name: Notify Discord after infrastructure apply
+        if: steps.apply.outcome == 'success'
+        working-directory: .
+        run: |
+          WEBHOOK='${{ secrets.DISCORD_WEBHOOK_URL }}'
+          if [ -z "$WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK_URL is not configured. Skipping notification."
+            exit 0
+          fi
+          jq -n --arg content "🚀 KoalaTech infrastructure applied. AKS estimate: ${{ steps.cost.outputs.hourly_cost }} ${{ steps.cost.outputs.currency }}/hour, commit ${{ github.sha }}." '{content:$content}' \
+            | curl -fsS -H 'Content-Type: application/json' -d @- "$WEBHOOK"
+
       - name: Terraform destroy
-        if: github.event.inputs.action == 'destroy'
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'destroy'
         run: terraform destroy -input=false -auto-approve
 
-  # =========================================================
-  # Monitoring: Prometheus and Grafana on AKS
-  # =========================================================
   monitoring:
     name: Deploy Prometheus and Grafana
     runs-on: ubuntu-latest
@@ -103,10 +187,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Login to Azure
-        uses: azure/login@v2
+        uses: azure/login@v3
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
@@ -136,8 +220,6 @@ jobs:
       - name: Validate monitoring stack
         run: |
           kubectl get pods -n monitoring
-
-          # Prometheus must answer and report targets
           kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090:9090 &
           sleep 8
           TARGETS=$(curl -s "http://localhost:9090/api/v1/query?query=up" | jq '.data.result | length')
@@ -147,8 +229,7 @@ jobs:
       - name: Show Grafana address
         run: |
           for i in {1..30}; do
-            IP=$(kubectl get svc kube-prometheus-stack-grafana -n monitoring \
-              -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+            IP=$(kubectl get svc kube-prometheus-stack-grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
             if [ -n "$IP" ]; then
               echo "Grafana: http://$IP" | tee -a "$GITHUB_STEP_SUMMARY"
               exit 0
